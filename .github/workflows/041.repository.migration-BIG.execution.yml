@@ -1,0 +1,342 @@
+name: GitHub Repository Migration for Big Repos
+
+on:
+  workflow_call:
+    # secrets:
+    #   TARGET_ADMIN_TOKEN:
+    #     required: true
+    #   SOURCE_ADMIN_TOKEN:
+    #     required: true
+    #   GH_MIGRATION_PAT:
+    #     required: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  prepare:
+    name: Prepare
+    runs-on: Migration-fixed-ip-Ubuntu-4-core-runner
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+      options: --user root
+    outputs:
+      repositories: ${{ steps.json.outputs.repositories }}
+      target_organization: ${{ steps.json.outputs.target_organization }}
+      migration-type: ${{ steps.migration-type.outputs.result }}
+      parsed-issue: ${{ steps.parse-issue-body.outputs.jsonString }}
+     
+    if: github.event_name == 'issue_comment' &&
+      (contains(github.event.comment.body, '/run-dry-run-migration') ||
+      contains(github.event.comment.body, '/run-production-migration'))
+
+    steps:
+      - name: Check out scripts
+        uses: actions/checkout@v4
+
+      - name: Parse issue body
+        id: parse-issue-body
+        uses: Legal-General-Group-Digital/github-issue-parser-action@v3
+
+      - run: echo "${JSON_STRING}"
+        env:
+          JSON_STRING: ${{ steps.parse-issue-body.outputs.jsonString }}
+        if: ${{ runner.debug == '1' }}
+
+      - name: Set migration type
+        uses: actions/github-script@v6
+        id: migration-type
+        with:
+          result-encoding: string
+          script: |
+            return context.payload.comment.body.match('dry-run') ? 'Dry-run' : 'Production'
+
+      - name: Add migration comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const body = `:hourglass: **${{ steps.migration-type.outputs.result }} migration in progress.** [View workflow run for details](${context.payload.repository.html_url}/actions/runs/${context.runId})`
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            })
+
+      - name: Build matrix
+        uses: actions/github-script@v6
+        id: json
+        with:
+          script: |
+            let repositories = process.env.REPOSITORIES.replace(/\r/g, '').split('\n').map(line => line.split(' ')[0]);
+            let target_organization = process.env.REPOSITORIES.replace(/\r/g, '').split('\n').map(line => line.split(' ')[1]);
+            let r_json = JSON.stringify(repositories);
+            let o_json = JSON.stringify(target_organization);
+            console.log(`Repositories to migrate:\n${r_json}`);
+            console.log(`Target Organization to migrate to:\n${o_json}`);
+            core.setOutput('repositories', r_json);
+            core.setOutput('target_organization', o_json);
+        env:
+          REPOSITORIES: ${{ steps.parse-issue-body.outputs.issueparser_repositories }}
+
+  migrate:
+    name: Migrate
+    runs-on: Migration-fixed-ip-Ubuntu-4-core-runner
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+      options: --user root
+    needs: prepare
+    strategy:
+      matrix:
+        repository: ${{ fromJson(needs.prepare.outputs.repositories) }}
+      fail-fast: false
+      max-parallel: 5
+
+    # Maximize the timeout to 50,400 minutes (35 days) from the default
+    # limit of 360 minutes (6 hours), as migrations can take some time.
+    timeout-minutes: 50400
+
+    env:
+      # switch to 'false' if you don't want to run the apt-get commands and GEI
+      INSTALL_PREREQS: "true"
+
+    steps:
+      - name: Check out scripts
+        uses: actions/checkout@v4
+        with:
+         token: ${{ secrets.GK_PAT }}
+
+      - name: Install common dependencies
+        if: ${{ env.INSTALL_PREREQS == 'true' }}
+        run: |
+          apt-get update
+          apt-get install --yes git unzip curl wget apt-transport-https software-properties-common
+
+      - name: Install GitHub Enterprise Importer
+        if: ${{ env.INSTALL_PREREQS == 'true' }}
+        run: |
+          if [ -z "$(command -v gei)" ]
+          then
+            wget https://github.com/github/gh-gei/releases/latest/download/gei-linux-amd64
+            install --owner root --group root --mode 755 gei-linux-amd64 /usr/local/bin/gei
+          fi
+
+      - if: ${{ runner.debug == '1' }}
+        name: GEI version number
+        run: gei --version
+
+      - name: Install PowerShell
+        if: ${{ env.INSTALL_PREREQS == 'true' }}
+        run: |
+          if [ -z "$(command -v pwsh)" ]
+          then
+            wget "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+            dpkg --install packages-microsoft-prod.deb
+            apt-get update
+            apt-get install --yes powershell
+          fi
+
+      - if: ${{ runner.debug == '1' }}
+        name: PowerShell version number
+        run: pwsh --version
+
+      - name: Create lock flag based on migration type
+        uses: actions/github-script@v6
+        id: lock-flag
+        with:
+          result-encoding: string
+          script: |
+            return '${{ needs.prepare.outputs.migration-type }}' === 'Production' ? '' : ''
+
+      - name: Setup Node
+        uses: actions/setup-node@v3
+        with:
+          node-version: 16
+      - run: |
+          npm i octokit@2.1.0 fs
+
+      - name: Migrate repositories
+        shell: pwsh
+        id: migrate
+        run: |
+          function Exec {
+              param (
+                  [scriptblock]$ScriptBlock
+              )
+              & @ScriptBlock
+              if ($lastexitcode -ne 0) {
+                  exit $lastexitcode
+              }
+          }
+
+          function ExecAndGetMigrationID {
+              param (
+                  [scriptblock]$ScriptBlock
+              )
+              $MigrationID = Exec $ScriptBlock | ForEach-Object {
+                  Write-Host $_
+                  $_
+              } | Select-String -Pattern "\(ID: (.+)\)" | ForEach-Object { $_.matches.groups[1] }
+              return $MigrationID
+          }
+        
+          $VisibilityValue = $Env:VISIBILITY.ToLower()
+       
+          Write-Host "The value of Visibility is : $VisibilityValue"
+          Write-Host "The value of REPO_TORG is: $Env:REPO_TORG"
+          Write-Host "The value of REPO_REP is: $Env:REPO_REP"
+
+          $RepoMigrations = [ordered]@{}
+          $RepoSources = $Env:REPOSITORIES.Split("`n")
+
+          $REPO_TORG = $Env:REPO_TORG -replace '[\[\]"]', '' -split ','
+          $REPO_REP = $Env:REPO_REP -replace '[\[\]"]', '' -split ','
+         
+          # Create an empty hashtable
+          $repoDictionary = @{}
+          
+          # Populate the hashtable
+          for ($i = 0; $i -lt $REPO_REP.Length; $i++) {
+            $repoDictionary[$REPO_REP[$i]] = $REPO_TORG[$i]
+          }
+
+          # Print the hashtable
+          $repoDictionary
+          
+          foreach ($Repo in $RepoSources) {
+              $Repo = $Repo.Trim()
+              Write-Host "Repo: $Repo"
+
+              $Parts = $Repo.Split("/")
+              $RepoName = $Parts[$Parts.length - 1]
+              $RepoOrg = $Parts[$Parts.length -2]
+              $RepoHost = $Parts[2]
+
+              # Lookup target organization from the dictionary
+              $TargetOrg = $repoDictionary[$Repo]
+
+              Write-Host "Target Organization Value is: $TargetOrg"
+
+              if ($RepoHost -ne 'github.com') {
+                  $ServerIncludeArg = "--ghes-api-url"
+                  $ServerIncludeValue = "https://$($RepoHost)/api/v3"
+              }
+              
+              $MigrationID = ExecAndGetMigrationID {
+                  gei migrate-repo                                        `
+                  --source-repo $RepoName                                 `
+                  --target-repo $RepoName                                 `
+                  --github-source-org $RepoOrg                            `
+                  --github-target-org $TargetOrg                          `
+                  --target-repo-visibility $VisibilityValue               `
+                  $ServerIncludeArg $ServerIncludeValue                   `
+                  --queue-only
+              }
+
+              if (!$null -eq $MigrationID) {
+                  Write-Host "Queued migration of repository $RepoName with ID $MigrationID"
+                  $RepoMigrations[$RepoName] = $MigrationID
+                  echo "::set-output name=migration-id::$MigrationID" 
+                  # echo "migration-id=$MigrationID" >> "$GITHUB_OUTPUT"
+              }
+          }
+
+          if ($RepoMigrations.count -eq 0) {
+              Write-Host "No migrations were started. Exiting..."
+              exit 1
+          }
+        env:
+          GH_PAT: ${{ secrets.TARGET_ADMIN_TOKEN }}
+          GH_SOURCE_PAT: ${{ secrets.SOURCE_ADMIN_TOKEN }}
+          REPOSITORIES: ${{ matrix.repository }}
+          VISIBILITY: ${{ fromJson(needs.prepare.outputs.parsed-issue).target_repository_visibility }}
+          REPO_TORG: ${{ needs.prepare.outputs.target_organization }}
+          REPO_REP: ${{ needs.prepare.outputs.repositories }}
+
+      # - name: Check if output directory exists
+      #   run: |
+      #     if [ ! -d "${{ github.workspace }}/migration-status" ]; then
+      #       echo "Output directory does not exist. Creating..."
+      #       mkdir -p "${{ github.workspace }}/migration-status"
+      #     else
+      #       echo "Output directory already exists."
+      #     fi
+
+      - name: Write repo migration status
+        if: always()
+        id: write-status
+        run: |
+          reponame="$(basename "${{ matrix.repository }}")"
+          migrationid="${{ steps.migrate.outputs.migration-id }}"
+          echo "repo-name=$reponame" >> "$GITHUB_OUTPUT"
+          echo "${{ matrix.repository }}, ${{ job.status }}, $migrationid" > ${reponame}.txt
+
+
+      - name: Upload repo migration status
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: statuses
+          path: ${{ steps.write-status.outputs.repo-name }}.txt
+
+  commit-status-files:
+    name: Commit Migration Status Files
+    runs-on: Migration-fixed-ip-Ubuntu-4-core-runner
+    needs: [prepare, migrate]
+    if: always()
+    env:
+      GK_PAT: ${{ secrets.GK_PAT }}
+    steps:
+      - name: Check out scripts
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GK_PAT }}
+
+      - uses: actions/download-artifact@v3
+        id: download-artifact
+        with:
+          name: statuses
+          path: migration-status
+
+      - name: Setup Committer Email and Name
+        run: |
+          git config user.email ${{ secrets.GIT_COMMITTER_EMAIL }}
+          git config user.name ${{ secrets.GIT_COMMITTER_NAME }}
+        
+
+      - name: Import GPG key
+        run: |
+          echo "${GPG_PRIVATE_KEY}" | gpg --batch --import
+        env: 
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        
+
+      - name: Add the custom gpg signing program that passes the passphrase to the gpg CLI
+        run: |
+          rm -rf /tmp/gpg.sh
+          echo '#!/bin/bash' >> /tmp/gpg.sh
+          echo 'gpg --batch --pinentry-mode=loopback --passphrase $GPG_KEY_PASSPHRASE $@' >> /tmp/gpg.sh
+          chmod +x /tmp/gpg.sh
+        
+
+      - name: Setup git
+        run: |
+          git config commit.gpgsign true
+          git config user.signingkey $GPG_KEY_ID
+          git config gpg.program /tmp/gpg.sh
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        
+
+      - name: Commit Changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -S -m "Added the migration status files - $(date +"%Y-%m-%d %H:%M:%S")" 
+            git push origin main
+          else
+              echo "There are no changes to commit."
+          fi
+        env:
+          GPG_KEY_PASSPHRASE: ${{ secrets.PASSPHRASE }}
