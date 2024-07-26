@@ -1,0 +1,195 @@
+name: Check Migration Status
+
+on:
+  issues:
+    types:
+      - opened
+      - edited
+
+jobs:
+  check-migration-status:
+    if: contains(github.event.issue.labels.*.name, 'check-migration-status')
+    runs-on: Migration-fixed-ip-Ubuntu-4-core-runner
+    strategy:
+      matrix:
+        repository: ${{ fromJson(github.event.issue.body).*.repository }}
+      fail-fast: false
+      max-parallel: 10
+    env:
+      # switch to 'false' if you don't want to run the apt-get commands and GEI
+      INSTALL_PREREQS: "true"
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install common dependencies
+      if: ${{ env.INSTALL_PREREQS == 'true' }}
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes git unzip curl wget apt-transport-https software-properties-common
+
+    - name: Install GitHub Enterprise Importer
+      if: ${{ env.INSTALL_PREREQS == 'true' }}
+      run: |
+        if [ -z "$(command -v gei)" ]
+        then
+          wget https://github.com/github/gh-gei/releases/latest/download/gei-linux-amd64
+          sudo install --owner root --group root --mode 755 gei-linux-amd64 /usr/local/bin/gei
+        fi
+
+    - if: ${{ runner.debug == '1' }}
+      name: GEI version number
+      run: gei --version
+
+    - name: Install PowerShell
+      if: ${{ env.INSTALL_PREREQS == 'true' }}
+      run: |
+        if [ -z "$(command -v pwsh)" ]
+        then
+          wget "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb"
+          sudo dpkg --install packages-microsoft-prod.deb
+          sudo apt-get update
+          sudo apt-get install --yes powershell
+        fi
+
+    - if: ${{ runner.debug == '1' }}
+      name: PowerShell version number
+      run: pwsh --version
+
+    - name: Setup Node
+      uses: actions/setup-node@v3
+      with:
+        node-version: 16
+    - run: |
+        npm i octokit@2.1.0 fs
+
+    - name: Read and check migration status
+      id: check-status
+      shell: pwsh
+      run: |
+        $repoName = '${{ matrix.repository }}'
+        $migrationStatusDir = 'migration-status'
+        $MigrationStatusFilePath = "$migrationStatusDir/$repoName.txt"
+        $StatusReportPath = "migration_status_report_$repoName.txt"
+
+        # # Clear previous status report if first run
+        # if ('${{ matrix.repository }}' -eq '${{ matrix.repository[0] }}') {
+        #   if (Test-Path $StatusReportPath) {
+        #     Remove-Item $StatusReportPath
+        #   }
+        # }
+
+        # Check if the migration status file exists
+        if (Test-Path $MigrationStatusFilePath) {
+          # Read the migration status file
+          $migrationData = Get-Content $MigrationStatusFilePath | Out-String
+          $migrationId = $migrationData.Split(",")[2].Trim()
+
+          # Function to check migration status
+          function Check-MigrationStatus {
+            param ($MigrationID, $RepoName)
+
+            $outputFile = "migration_output.txt"
+            $errorFile = "migration_error.txt"
+
+            # Start the gei process
+            $process = Start-Process gei -ArgumentList "wait-for-migration --migration-id $MigrationID" -NoNewWindow -PassThru -RedirectStandardOutput "$outputFile" -RedirectStandardError "$errorFile"
+            Start-Sleep -Seconds 10
+
+            # Check the status from the output file
+            $migrationStatus = Get-Content $outputFile, $errorFile | Out-String
+
+            $statusMessage = $migrationStatus | Select-String -Pattern "Migration.*for $RepoName is (\w+)"
+            $successMessage = $migrationStatus | Select-String -Pattern "Migration $MigrationID succeeded for $RepoName"
+            $errorMessage = $migrationStatus | Select-String -Pattern "Migration $MigrationID failed for $RepoName"
+            
+
+            # Stop the process if it is still running
+            if (!$process.HasExited) {
+              Stop-Process -Id $process.Id
+            }
+
+            if ($successMessage) {
+              $inProgress = $false
+              return "succeeded"
+            } elseif ($statusMessage) {
+              return $statusMessage.Matches.Groups[1].Value
+            } elseif ($errorMessage) {
+              return "failed"
+            } else {
+              return "$migrationStatus"
+            }
+          }
+
+          # Check the migration status
+          $finalStatus = Check-MigrationStatus -MigrationID $migrationId -RepoName $repoName
+
+          # Append the result to the status report
+          "$repoName, $migrationId, $finalStatus" | Out-File -FilePath $StatusReportPath -Append
+        } else {
+          # Log a message if the migration status file is not found
+          "$repoName, No migration status file found" | Out-File -FilePath $StatusReportPath -Append
+        }
+      env:
+        GH_PAT: ${{ secrets.TARGET_ADMIN_TOKEN }}
+
+    - name: Upload migration status report
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: migration-status-report
+        path: migration_status_report_*.txt
+
+
+  process-migration-status-reports:
+      needs: check-migration-status
+      runs-on: Migration-fixed-ip-Ubuntu-4-core-runner
+
+      steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download migration status reports
+        uses: actions/download-artifact@v3
+        with:
+          name: migration-status-report
+          path: migration_status_reports
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install openpyxl
+        run: pip install openpyxl
+
+      - name: Update Excel file with migration status
+        run: |
+          import os
+          from openpyxl import Workbook, load_workbook
+
+          excel_file = 'migration_status.xlsx'
+          wb = Workbook()
+
+          if os.path.exists(excel_file):
+              wb = load_workbook(excel_file)
+          else:
+              ws = wb.active
+              ws.append(['Repository Name', 'Migration ID', 'Migration Status'])
+
+          for file_name in os.listdir('migration_status_reports'):
+              if file_name.startswith('migration_status_report_') and file_name.endswith('.txt'):
+                  with open(os.path.join('migration_status_reports', file_name), 'r') as file:
+                      content = file.read().strip()
+                      repo_name, migration_id, migration_status = content.split(', ')
+                      ws.append([repo_name, migration_id, migration_status])
+
+          wb.save(excel_file)
+        shell: python
+
+      - name: Upload updated Excel file
+        uses: actions/upload-artifact@v3
+        with:
+          name: migration-status-excel
+          path: migration_status.xlsx  
