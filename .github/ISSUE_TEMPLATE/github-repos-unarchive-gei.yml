@@ -1,0 +1,15 @@
+name: GHES/GHEC repos to Unarchive on Source [DIGITAL]
+description: GHES/GHEC repos to Unarchive on Source [DIGITAL] on Need basiss
+title: "GHES/GHEC repos to Unarchive on Source [DIGITAL]"
+labels: ["unarchive", "gei"]
+body:
+  - type: textarea
+    id: repositories
+    attributes:
+      label: Repositories
+      description: Please enter the GitHub repositories that you would like to unarchive
+      placeholder: |
+        your-org/your-repository-1
+        your-org/your-repository-2
+    validations:
+      required: true
